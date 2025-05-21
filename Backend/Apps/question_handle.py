@@ -1,9 +1,11 @@
+import imghdr
 import os
 import uuid
 from flask import Blueprint, jsonify, request, stream_with_context, Response
 from .genericFunction import LLMs_allowed_file, LLMs_StreamOutput, LLM, ragflow, get_globalWeb_source,LLM_StreamOutput
 from config.config import LLMs_IMAGE_UPLOAD_FOLDER,LLMs_FILE_UPLOAD_FOLDER,Public_ip,LLMs_model
 
+import base64
 ques_handle_bp = Blueprint('ques_handle', __name__)
 
 
@@ -177,61 +179,89 @@ def kn_chat():
 
     return Response(generate_stream(), content_type='text/event-stream')
 
+#tx_新增聊天历史保存、base64编码传递给大模型-5-21日新增
+# 用于存储不同 session 的历史
+session_histories = {}
 
 @ques_handle_bp.route('/chat', methods=['POST'])
 def chat():
-    data = request.json
-    image_urls = data.get('image_urls')  # 从请求中获取图片URL，至少是一个空list
-    print(f"image_urls:{image_urls}")
+    import json
 
-    image_urls="None"
-    
-    # files_urls = data.get('files_urls')  # 从请求中获取文件的URL
-    user_message = data.get('message')  # 从请求中获取用户消息及历史记录
+    session_id = request.form.get("session_id")
+    if not session_id:
+        return jsonify({"content": "缺少 session_id", 'status': -5})
+    file = request.files.get('file', None)
+    #print("前端传来的file\n",file)
+    image_base64 = None
+    image_mime = None
 
-    user_mesg = user_message[-1]['content']  # 获取最新一条的用户消息提问
-    del user_message[-1]
+    if file:
+        if file.filename == '':
+            return jsonify({"content": "没有选择图片", 'status': -1})
+        if not LLMs_allowed_file(file.filename, 'image'):
+            return jsonify({"content": "不支持的文件类型", 'status': -2})
 
-    content_images = []  # 构建最新一条的user提问消息内容
-    if image_urls != []:
-        for image_url in image_urls:
-            obj_img = {
-                "type": "image_url",
-                "image_url": {"url": image_url},
-            }
-            content_images.append(obj_img)
-    content_images.append({"type": "text", "text": user_mesg})
+        image_bytes = file.read()
+        image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+        image_format = imghdr.what(None, h=image_bytes)
+        if image_format not in ['png', 'jpeg']:
+            return jsonify({"content": f"不支持的图片格式: {image_format}", 'status': -2})
+        image_mime = f"image/{image_format}"
 
-    # 创建聊天完成请求
-    messages=[]
-    for message in user_message:
-        if message['role']=="user":
-            messages.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": message['content'],
-                    }
-                ]
-            })
-        else:
-            messages.append(message)
+    user_message = request.form.get("message")
+    if not user_message:
+        return jsonify({"content": "缺少用户消息", 'status': -3})
 
+    history = session_histories.get(session_id, [])
 
-    messages.append({
+    content = []
+    if image_base64 and image_mime:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{image_mime};base64,{image_base64}"}
+        })
+    content.append({"type": "text", "text": user_message})
+
+    current_user_message = {
         "role": "user",
-        "content": content_images})
+        "content": content
+    }
+    history.append(current_user_message)
+    session_histories[session_id] = history
+    #print("session_histories\n",session_histories)
 
-    print(f"最终message:{messages}")
+    def generate_and_save_reply():
+        answer_content = ""
+        is_answering = False
 
-    response = Response(stream_with_context(LLMs_StreamOutput(messages)), content_type='text/plain')
+        for chunk in LLMs_StreamOutput(history):
+            # chunk 是流的字符串片段，比如 <think>、</think>、reasoning_content片段或内容片段
+            if chunk == "<think>":
+                # 思考过程开始，跳过存储
+                yield chunk
+                continue
+            elif chunk == "</think>":
+                # 思考过程结束，回复开始
+                is_answering = True
+                yield chunk
+                continue
 
-    return response
+            if is_answering:
+                # 收集最终回复
+                answer_content += chunk
 
+            yield chunk
 
-
-
+        # 回复结束后，将最终回复加入历史
+        if answer_content.strip():
+            model_reply_message = {
+                "role": "assistant",
+                "content": [{"type": "text", "text": answer_content}]
+            }
+            history.append(model_reply_message)
+            session_histories[session_id] = history
+    print("最终消息历史：\n",session_histories)
+    return Response(stream_with_context(generate_and_save_reply()), content_type='text/plain')
 
 #  - 基于知识点集合总库，对题库题目利用LLM进行标注，构建题目知识点总库
 @ques_handle_bp.route('/questionBank/Tagged', methods=['GET'])
